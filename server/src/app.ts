@@ -3,6 +3,7 @@ import compression from 'compression';
 import cors from 'cors';
 import helmet from 'helmet';
 import path from 'path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
 import { keysRouter } from './routes/keys.js';
 import { clientProfilesRouter } from './routes/client-profiles.js';
@@ -42,6 +43,11 @@ import { errorHandler } from './middleware/errorHandler.js';
 import { clientContextMiddleware } from './lib/client-context.js';
 import type { Config } from './lib/config.js';
 import { loadConfig } from './lib/config.js';
+import { initDb } from './db/index.js';
+import { userCount } from './services/auth.js';
+import { generateSetupCode } from './lib/setup-code.js';
+import { restoreProxySettings } from './lib/proxy.js';
+import { applyDeclarativeConfigFromEnv } from './services/declarative-config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -374,8 +380,36 @@ export function createApp(config?: Config) {
   return app;
 }
 
-// Vercel Express entrypoint: Vercel requires the detected Express module to
-// default-export a request handler/server. The regular long-running server
-// still imports createApp() from index.ts and is unaffected by this export.
+// Vercel Express entrypoint.
+//
+// The normal long-running server initializes SQLite in index.ts before it starts
+// listening. Vercel imports app.ts directly as a serverless function, so without
+// this bootstrap every /api request reaches routes before the database exists.
+//
+// Vercel's function filesystem is ephemeral. Use /tmp for the SQLite file so the
+// app can run correctly within a warm function instance. If ENCRYPTION_KEY is
+// not configured, generate a process-local key so a fresh deployment still
+// boots; for stable encrypted data across restarts, set ENCRYPTION_KEY in the
+// Vercel project settings.
+if (process.env.VERCEL) {
+  process.env.FREEAPI_DB_PATH ||= '/tmp/freellmapi/freeapi.db';
+
+  if (!process.env.ENCRYPTION_KEY) {
+    process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
+    console.warn(
+      '[vercel] ENCRYPTION_KEY was not set; generated an ephemeral key for this function instance. ' +
+      'Set ENCRYPTION_KEY in Vercel for stable encryption across restarts.',
+    );
+  }
+
+  initDb(process.env.FREEAPI_DB_PATH);
+  applyDeclarativeConfigFromEnv();
+  restoreProxySettings();
+
+  if (userCount() === 0) {
+    generateSetupCode();
+  }
+}
+
 const app = createApp();
 export default app;
