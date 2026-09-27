@@ -373,3 +373,9 @@ export function createApp(config?: Config) {
 
   return app;
 }
+
+// Vercel Express entrypoint: Vercel requires the detected Express module to
+// default-export a request handler/server. The regular long-running server
+// still imports createApp() from index.ts and is unaffected by this export.
+const app = createApp();
+export default app;
