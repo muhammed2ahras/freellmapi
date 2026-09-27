@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { createOneTimeCode } from './one-time-code.js';
 
 // One-time first-run setup code.
@@ -16,7 +17,8 @@ const _code = createOneTimeCode();
 // Mint a fresh code and log it prominently. Call once at boot when there are
 // zero accounts. Returns the code (handy for tests).
 export function generateSetupCode(): string {
-  const code = _code.generate();
+  const envCode = process.env.FREEAPI_SETUP_CODE?.trim();
+  const code = envCode || _code.generate();
   console.log('');
   console.log('  First-run setup code: ' + code);
   console.log('  A browser on this machine can finish setup without it. From any');
@@ -26,7 +28,8 @@ export function generateSetupCode(): string {
 }
 
 export function getSetupCode(): string | null {
-  return _code.get();
+  const envCode = process.env.FREEAPI_SETUP_CODE?.trim();
+  return envCode || _code.get();
 }
 
 export function clearSetupCode(): void {
@@ -36,5 +39,13 @@ export function clearSetupCode(): void {
 // Constant-time comparison against the active code. Returns false when no code
 // is active or the input is not a matching string.
 export function setupCodeMatches(provided: unknown): boolean {
+  const envCode = process.env.FREEAPI_SETUP_CODE?.trim();
+  if (envCode) {
+    if (typeof provided !== 'string') return false;
+    const expected = Buffer.from(envCode);
+    const actual = Buffer.from(provided);
+    if (expected.length !== actual.length) return false;
+    return crypto.timingSafeEqual(expected, actual);
+  }
   return _code.matches(provided);
 }
