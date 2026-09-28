@@ -126,7 +126,10 @@ function isLoopbackRemote(req: Request): boolean {
 authRouter.get('/status', (req: Request, res: Response) => {
   const session = validateSession(bearer(req));
   res.json({
-    needsSetup: userCount() === 0,
+    // On serverless hosts the local SQLite database can differ between
+    // instances. A valid signed session must take precedence over an empty
+    // instance-local users table, otherwise the UI jumps back to setup.
+    needsSetup: !session && userCount() === 0,
     authenticated: !!session,
     email: session?.email ?? null,
   });
