@@ -395,11 +395,22 @@ if (process.env.VERCEL) {
   process.env.FREEAPI_DB_PATH ||= '/tmp/freellmapi/freeapi.db';
 
   if (!process.env.ENCRYPTION_KEY) {
-    process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
-    console.warn(
-      '[vercel] ENCRYPTION_KEY was not set; generated an ephemeral key for this function instance. ' +
-      'Set ENCRYPTION_KEY in Vercel for stable encryption across restarts.',
-    );
+    const stableSeed = process.env.FREEAPI_SETUP_CODE?.trim();
+    if (stableSeed) {
+      process.env.ENCRYPTION_KEY = crypto
+        .createHash('sha256')
+        .update(`freellmapi-vercel:${stableSeed}`)
+        .digest('hex');
+      console.warn(
+        '[vercel] ENCRYPTION_KEY was not set; derived a stable key from FREEAPI_SETUP_CODE. ' +
+        'For stronger security, set a dedicated 64-character ENCRYPTION_KEY in Vercel.',
+      );
+    } else {
+      process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
+      console.warn(
+        '[vercel] ENCRYPTION_KEY and FREEAPI_SETUP_CODE were not set; generated an ephemeral key for this function instance.',
+      );
+    }
   }
 
   initDb(process.env.FREEAPI_DB_PATH);
