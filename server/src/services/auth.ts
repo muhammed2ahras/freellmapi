@@ -8,6 +8,52 @@ import { hashPassword, verifyPassword } from '../lib/password.js';
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+type StatelessSessionPayload = {
+  userId: number;
+  email: string;
+  expiresAt: number;
+};
+
+function isVercelRuntime(): boolean {
+  return !!process.env.VERCEL;
+}
+
+function sessionSigningSecret(): string {
+  const secret = process.env.ENCRYPTION_KEY?.trim();
+  if (!secret) {
+    throw new Error('ENCRYPTION_KEY is required for stateless Vercel dashboard sessions.');
+  }
+  return secret;
+}
+
+function encodeStatelessSession(payload: StatelessSessionPayload): string {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', sessionSigningSecret()).update(body).digest('base64url');
+  return `v1.${body}.${signature}`;
+}
+
+function decodeStatelessSession(token: string): StatelessSessionPayload | null {
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts[0] !== 'v1') return null;
+  const body = parts[1]!;
+  const provided = parts[2]!;
+  const expected = crypto.createHmac('sha256', sessionSigningSecret()).update(body).digest('base64url');
+  const a = Buffer.from(expected);
+  const b = Buffer.from(provided);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as StatelessSessionPayload;
+    if (!payload || typeof payload.userId !== 'number' || typeof payload.email !== 'string' || typeof payload.expiresAt !== 'number') {
+      return null;
+    }
+    if (payload.expiresAt < Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 export interface SessionUser {
   userId: number;
   email: string;
@@ -57,6 +103,16 @@ export function verifyCredentials(email: string, password: string): SessionUser 
 
 /** Mint a session and return the raw token (only the hash is persisted). */
 export function createSession(userId: number): string {
+  if (isVercelRuntime()) {
+    const row = getDb().prepare('SELECT email FROM users WHERE id = ?').get(userId) as { email: string } | undefined;
+    if (!row) throw new Error('Cannot create session for unknown user');
+    return encodeStatelessSession({
+      userId,
+      email: row.email,
+      expiresAt: Date.now() + SESSION_TTL_MS,
+    });
+  }
+
   const token = crypto.randomBytes(32).toString('hex');
   getDb().prepare('INSERT INTO sessions (token_hash, user_id, expires_at_ms) VALUES (?, ?, ?)')
     .run(sha256(token), userId, Date.now() + SESSION_TTL_MS);
@@ -66,6 +122,12 @@ export function createSession(userId: number): string {
 /** Resolve a session token to its user, or null if missing/expired. */
 export function validateSession(token: string | undefined | null): SessionUser | null {
   if (!token) return null;
+
+  if (isVercelRuntime()) {
+    const payload = decodeStatelessSession(token);
+    return payload ? { userId: payload.userId, email: payload.email } : null;
+  }
+
   const db = getDb();
   const row = db.prepare(`
     SELECT s.user_id, s.expires_at_ms, u.email
@@ -82,6 +144,7 @@ export function validateSession(token: string | undefined | null): SessionUser |
 
 export function deleteSession(token: string | undefined | null): void {
   if (!token) return;
+  if (isVercelRuntime()) return;
   getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
 }
 
