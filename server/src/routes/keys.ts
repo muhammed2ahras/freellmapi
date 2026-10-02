@@ -4,6 +4,7 @@ import { z } from 'zod';
 import multer from 'multer';
 import path from 'path';
 import { getDb } from '../db/index.js';
+import { backupDbNow, isDbBackupConfigured } from '../lib/db-backup.js';
 import { resolveProvider, getAllProviders } from '../providers/index.js';
 import { OpenAICompatProvider } from '../providers/openai-compat.js';
 import { getSyncState } from '../services/catalog-sync.js';
@@ -26,6 +27,30 @@ import { parseModelScope } from '../lib/model-scope.js';
 import { KEY_PROXY_URL_ERROR, KEY_PROXY_URL_MAX, decryptProxyUrl, encryptProxyUrl, isValidKeyProxyUrl, maskProxyUrl } from '../lib/key-proxy.js';
 
 export const keysRouter = Router();
+
+function vercelImportPersistenceError(): string | null {
+  if (!process.env.VERCEL) return null;
+
+  const target = (process.env.FREEAPI_DB_BACKUP_TARGET ?? process.env.FREEAPI_DB_BACKUP_URL ?? '').trim();
+  if (!/^https?:\/\//i.test(target)) {
+    return 'Persistent key imports on Vercel need FREEAPI_DB_BACKUP_URL set to a durable HTTP(S) URL that supports GET and PUT.';
+  }
+  if (!isDbBackupConfigured()) {
+    return 'Persistent key imports on Vercel need a configured database backup target.';
+  }
+  if (!process.env.ENCRYPTION_KEY?.trim() && !process.env.FREEAPI_SETUP_CODE?.trim()) {
+    return 'Set a stable ENCRYPTION_KEY (or FREEAPI_SETUP_CODE) in Vercel so imported credentials remain decryptable after an instance change.';
+  }
+  return null;
+}
+
+async function saveVercelImportSnapshot(db: Db): Promise<void> {
+  if (!process.env.VERCEL) return;
+  const result = await backupDbNow(db);
+  if (!result.ok) {
+    throw new Error('SQLite snapshot upload did not complete');
+  }
+}
 
 // Active providers — must match providers/index.ts registrations + shared/types.ts Platform.
 // Moonshot and MiniMax direct integrations were dropped in V4. HuggingFace
@@ -1225,6 +1250,12 @@ keysRouter.post('/import', (req: Request, res: Response, next: NextFunction) => 
     if (handleUploadError(err, res, next)) return;
 
     try {
+      const persistenceError = vercelImportPersistenceError();
+      if (persistenceError) {
+        res.status(503).json({ error: { message: persistenceError } });
+        return;
+      }
+
       if (!req.file) {
         res.status(400).json({ error: { message: 'No file uploaded' } });
         return;
@@ -1303,6 +1334,10 @@ keysRouter.post('/import', (req: Request, res: Response, next: NextFunction) => 
         }
       }
 
+      if (imported.length > 0) {
+        await saveVercelImportSnapshot(getDb());
+      }
+
       res.json({
         imported: imported.length,
         skipped,
@@ -1377,6 +1412,12 @@ keysRouter.post('/preview', (req: Request, res: Response, next: NextFunction) =>
 });
 
 keysRouter.post('/import-selected', async (req: Request, res: Response) => {
+  const persistenceError = vercelImportPersistenceError();
+  if (persistenceError) {
+    res.status(503).json({ error: { message: persistenceError } });
+    return;
+  }
+
   const parsed = z.object({ keys: z.array(importKeySchema).max(100) }).safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -1455,6 +1496,18 @@ keysRouter.post('/import-selected', async (req: Request, res: Response) => {
       existingKeys.add(key.keyValue.trim());
     } catch (err) {
       errors.push({ key: keyName, error: (err as Error).message });
+    }
+  }
+
+  if (imported > 0) {
+    try {
+      await saveVercelImportSnapshot(db);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      res.status(502).json({
+        error: { message: `Imported ${imported} key(s) into this instance, but the durable database snapshot failed: ${detail}` },
+      });
+      return;
     }
   }
 

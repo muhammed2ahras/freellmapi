@@ -44,6 +44,7 @@ import { clientContextMiddleware } from './lib/client-context.js';
 import type { Config } from './lib/config.js';
 import { loadConfig } from './lib/config.js';
 import { initDb } from './db/index.js';
+import { restoreDbBackupIfNeeded } from './lib/db-backup.js';
 import { userCount } from './services/auth.js';
 import { generateSetupCode } from './lib/setup-code.js';
 import { restoreProxySettings } from './lib/proxy.js';
@@ -108,6 +109,12 @@ export function createApp(config?: Config) {
   // /CIDRs trusts only those proxies. Must be set before client-context and
   // the rate-limit middleware, which both resolve the client IP.
   app.set('trust proxy', cfg.trustProxy);
+  if (process.env.VERCEL) {
+    // Restore the last durable SQLite snapshot before any route accesses the DB.
+    app.use((_req, _res, next) => {
+      void ensureVercelDbInitialized().then(() => next()).catch(next);
+    });
+  }
   const allowedCorsOrigins = new Set([
     ...DEFAULT_DASHBOARD_ORIGINS,
     ...cfg.dashboardOrigins,
@@ -380,46 +387,46 @@ export function createApp(config?: Config) {
   return app;
 }
 
-// Vercel Express entrypoint.
-//
-// The normal long-running server initializes SQLite in index.ts before it starts
-// listening. Vercel imports app.ts directly as a serverless function, so without
-// this bootstrap every /api request reaches routes before the database exists.
-//
-// Vercel's function filesystem is ephemeral. Use /tmp for the SQLite file so the
-// app can run correctly within a warm function instance. If ENCRYPTION_KEY is
-// not configured, generate a process-local key so a fresh deployment still
-// boots; for stable encrypted data across restarts, set ENCRYPTION_KEY in the
-// Vercel project settings.
-if (process.env.VERCEL) {
-  process.env.FREEAPI_DB_PATH ||= '/tmp/freellmapi/freeapi.db';
+// Vercel Express entrypoint. SQLite lives under /tmp, which is only scratch
+// space for a particular serverless instance. Restore the durable snapshot once
+// before that instance serves its first request.
+let vercelDbInitialization: Promise<void> | null = null;
 
-  if (!process.env.ENCRYPTION_KEY) {
-    const stableSeed = process.env.FREEAPI_SETUP_CODE?.trim();
-    if (stableSeed) {
-      process.env.ENCRYPTION_KEY = crypto
-        .createHash('sha256')
-        .update(`freellmapi-vercel:${stableSeed}`)
-        .digest('hex');
-      console.warn(
-        '[vercel] ENCRYPTION_KEY was not set; derived a stable key from FREEAPI_SETUP_CODE. ' +
-        'For stronger security, set a dedicated 64-character ENCRYPTION_KEY in Vercel.',
-      );
-    } else {
-      process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
-      console.warn(
-        '[vercel] ENCRYPTION_KEY and FREEAPI_SETUP_CODE were not set; generated an ephemeral key for this function instance.',
-      );
-    }
+function ensureVercelDbInitialized(): Promise<void> {
+  if (!vercelDbInitialization) {
+    vercelDbInitialization = (async () => {
+      process.env.FREEAPI_DB_PATH ||= '/tmp/freellmapi/freeapi.db';
+
+      if (!process.env.ENCRYPTION_KEY) {
+        const stableSeed = process.env.FREEAPI_SETUP_CODE?.trim();
+        if (stableSeed) {
+          process.env.ENCRYPTION_KEY = crypto
+            .createHash('sha256')
+            .update(`freellmapi-vercel:${stableSeed}`)
+            .digest('hex');
+          console.warn(
+            '[vercel] ENCRYPTION_KEY was not set; derived a stable key from FREEAPI_SETUP_CODE. ' +
+            'For stronger security, set a dedicated 64-character ENCRYPTION_KEY in Vercel.',
+          );
+        } else {
+          process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
+          console.warn(
+            '[vercel] ENCRYPTION_KEY and FREEAPI_SETUP_CODE were not set; generated an ephemeral key for this function instance.',
+          );
+        }
+      }
+
+      await restoreDbBackupIfNeeded(process.env.FREEAPI_DB_PATH);
+      initDb(process.env.FREEAPI_DB_PATH);
+      applyDeclarativeConfigFromEnv();
+      restoreProxySettings();
+
+      if (userCount() === 0) {
+        generateSetupCode();
+      }
+    })();
   }
-
-  initDb(process.env.FREEAPI_DB_PATH);
-  applyDeclarativeConfigFromEnv();
-  restoreProxySettings();
-
-  if (userCount() === 0) {
-    generateSetupCode();
-  }
+  return vercelDbInitialization;
 }
 
 const app = createApp();
