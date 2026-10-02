@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: freellmapi
+    runtime: node
+    plan: 0.5c-512mb
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start -w server
+    healthCheckPath: /api/ping
+    disk:
+      name: freellmapi-sqlite
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: FREEAPI_DB_PATH
+        value: /var/data/freeapi.db
+      - key: ENCRYPTION_KEY
+        sync: false
